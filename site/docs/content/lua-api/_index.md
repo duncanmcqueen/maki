@@ -576,6 +576,10 @@ appear alongside other plugins' hints. If you need to own the whole slot
 
 Throws if you pass a singleton slot name.
 
+A function `content` is called before every run. Its first value goes in
+the system prompt, and later changes reach the model as a context update
+until the next compaction.
+
 **Parameters:**
 
 - `{spec}` (`table`) Hint specification:
@@ -642,7 +646,8 @@ Use this for slots like "identity" or "tone" where a single coherent value
 makes more sense than combining fragments. For aggregate slots like
 "tool_usage", use `register_prompt_hint` instead.
 
-Throws if you pass an aggregate slot name.
+Throws if you pass an aggregate slot name. A function `content` behaves
+as in `register_prompt_hint`.
 
 **Parameters:**
 
@@ -4421,10 +4426,12 @@ Reads a live session's transcript, oldest first: everything the model has
 been sent so far, tool calls and results included. Read only.
 
 Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
-`"assistant"`. `kind` is `"turn"` for something the user or the model said
-and `"observation"` for a report sent to the model as a user message, like
-`maki.session.notify`. `hidden` marks a message only the model sees, such
-as a nudge or a compaction note. `content` lists blocks:
+`"assistant"`. `kind` is `"turn"` for something the user or the model said,
+`"observation"` for a report sent to the model as a user message, like
+`maki.session.notify`, and `"context_update"` for a change since the
+system prompt was built (date, model, plan mode, ...). `hidden` marks a
+message only the model sees, such as a nudge or a compaction note.
+`content` lists blocks:
 
 ```text
 { type = "text", text }

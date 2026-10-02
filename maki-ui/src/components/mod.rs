@@ -377,6 +377,8 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// One dim line about what the host told the model on the user's behalf.
+    Notice,
 }
 
 impl DisplayRole {

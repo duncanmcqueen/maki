@@ -14,6 +14,7 @@ use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
+use url::Url;
 
 use maki_config::providers::Protocol;
 
@@ -31,11 +32,13 @@ use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
+const API_HOST: &str = "api.anthropic.com";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/v1/models?limit=1000";
 const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
+const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
 const LABEL_WEEK_ALL: &str = "Current week (all models)";
@@ -131,6 +134,17 @@ fn apply_fast_mode(body: &mut Value, model: &Model, opts: RequestOptions) -> boo
         body["speed"] = json!("fast");
     }
     on
+}
+
+/// The beta header alone makes the API list thinking blocks that fail the
+/// prefix check in `input_transformations` without changing what the model
+/// reads, so a moved prefix shows up in the logs. Setting
+/// `prefix_mismatch_behavior` instead would opt an older account into
+/// enforcement and drop reasoning it still reads. Where the check is enforced
+/// the request fails, see [`crate::AgentError::is_thinking_unbound`]. Only
+/// the Anthropic API itself gets it, because a gateway may reject the header.
+fn reports_block_binding(body: &Value, anthropic_api: bool) -> bool {
+    anthropic_api && body.get("thinking").is_some()
 }
 
 #[derive(Deserialize, Default)]
@@ -294,9 +308,15 @@ fn origin(base_url: &str) -> &str {
 /// True when `base_url` targets the real Anthropic API, directly or via the
 /// construction-time base-URL override (so quota stays visible behind a proxy).
 fn first_party(base_url: &str, configured_override: Option<&str>) -> bool {
-    let target = origin(base_url);
-    target.contains("api.anthropic.com")
-        || configured_override.is_some_and(|configured| origin(configured) == target)
+    is_anthropic_api(base_url)
+        || configured_override.is_some_and(|configured| origin(configured) == origin(base_url))
+}
+
+/// True only for the Anthropic API itself, not a proxy configured in front of
+/// it. Compares the parsed host, so a gateway whose URL merely mentions the
+/// API host does not pass.
+fn is_anthropic_api(base_url: &str) -> bool {
+    Url::parse(base_url).is_ok_and(|url| url.host_str() == Some(API_HOST))
 }
 
 /// Subscription quota only exists for OAuth tokens against the real Anthropic
@@ -500,7 +520,11 @@ impl Provider for Anthropic {
                 }]
             };
 
-            let top_p = self.auth.lock().unwrap().top_p;
+            let (top_p, anthropic_api) = {
+                let auth = self.auth.lock().unwrap();
+                let base_url = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
+                (auth.top_p, is_anthropic_api(base_url))
+            };
             let mut body = shared::build_request_body_with_system(
                 model,
                 messages,
@@ -520,6 +544,9 @@ impl Provider for Anthropic {
             }
             if shared::has_deferred_tools(tools) {
                 betas.push(shared::BETA_DEFERRED_TOOLS);
+            }
+            if reports_block_binding(&body, anthropic_api) {
+                betas.push(BLOCK_BINDING_BETA);
             }
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, ?betas, "sending API request");
@@ -662,7 +689,10 @@ pub(crate) async fn parse_sse(
 mod tests {
     use super::*;
     use crate::test_support::{Canned, serve};
-    use crate::{ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage};
+    use crate::{
+        ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
+        TokenUsage,
+    };
     use serde_json::{Value, json};
     use shared::build_wire_messages;
     use std::time::Duration;
@@ -902,6 +932,78 @@ data: {{\"type\":\"message_stop\"}}\n"
                 }
             );
         })
+    }
+
+    const DROPPED_PATH: &str = "messages.1.content.0";
+    const PREFIX_MISMATCH: &str = "prefix_binding_mismatch";
+    const THINKING_DROPPED: &str = "thinking_dropped";
+    const STARTED_INPUT_TOKENS: u32 = 42;
+    const DELTA_OUTPUT_TOKENS: u32 = 10;
+
+    fn dropped_thinking() -> InputTransformation {
+        InputTransformation {
+            kind: THINKING_DROPPED.into(),
+            path: DROPPED_PATH.into(),
+            reason: PREFIX_MISMATCH.into(),
+        }
+    }
+
+    /// The wire form of [`dropped_thinking`], with a field this build ignores.
+    fn dropped_thinking_entry() -> String {
+        format!(
+            r#"{{"type":"{THINKING_DROPPED}","path":"{DROPPED_PATH}","reason":"{PREFIX_MISMATCH}","block_index":3}}"#
+        )
+    }
+
+    /// `start` and `delta` are the `input_transformations` arrays of the two
+    /// events. `None` leaves the field out of the delta.
+    fn parse_transformations(start: &str, delta: Option<&str>) -> StreamResponse {
+        let delta_field = delta
+            .map(|list| format!(",\"input_transformations\":{list}"))
+            .unwrap_or_default();
+        let sse_data = format!(
+            "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":{STARTED_INPUT_TOKENS}}},\"input_transformations\":{start}}}}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":{DELTA_OUTPUT_TOKENS}}}{delta_field}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n"
+        );
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap()
+        })
+    }
+
+    #[test_case(None, true ; "from_message_start")]
+    #[test_case(Some("[]"), false ; "fallback_delta_replaces_start")]
+    fn parse_sse_input_transformations(delta: Option<&str>, kept: bool) {
+        let resp = parse_transformations(&format!("[{}]", dropped_thinking_entry()), delta);
+        let expected = if kept {
+            vec![dropped_thinking()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(resp.input_transformations, expected);
+    }
+
+    /// The field is in beta, so one odd entry must not cost the whole event,
+    /// with the usage billed and the stop reason that keeps a tool loop going.
+    #[test]
+    fn parse_sse_odd_input_transformation_keeps_the_event() {
+        let list = format!(r#"[{{"path":"p"}},{}]"#, dropped_thinking_entry());
+        let resp = parse_transformations(&list, Some(&list));
+
+        assert_eq!(
+            (resp.usage.input, resp.usage.output),
+            (STARTED_INPUT_TOKENS, DELTA_OUTPUT_TOKENS)
+        );
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(resp.input_transformations, vec![dropped_thinking()]);
     }
 
     #[test]
@@ -1337,6 +1439,21 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         let header = apply_fast_mode(&mut body, &model, RequestOptions::default());
         assert!(!header);
         assert!(body.get("speed").is_none());
+    }
+
+    /// A configured base URL counts as first party for quota, but may be a
+    /// gateway that rejects the header, so only the API itself gets it.
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), API_ORIGIN, true ; "thinking_anthropic_api")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://gateway.example.com", false ; "thinking_configured_gateway")]
+    #[test_case(json!({}), API_ORIGIN, false ; "no_thinking")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://api.anthropic.com.corp.example", false ; "host_lookalike")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://proxy.example/api.anthropic.com", false ; "host_in_path")]
+    #[test_case(json!({"thinking": {"type": "adaptive"}}), "https://api.anthropic.com/v1/messages?beta=true", true ; "api_with_path_and_query")]
+    fn reports_block_binding_gates(body: Value, base_url: &str, expected: bool) {
+        assert_eq!(
+            reports_block_binding(&body, is_anthropic_api(base_url)),
+            expected
+        );
     }
 
     #[test]

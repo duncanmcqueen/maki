@@ -3,15 +3,15 @@ use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 use flume::Sender;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::types::is_deferred_tool;
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ProviderEvent,
+    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
@@ -84,10 +84,33 @@ impl From<Usage> for TokenUsage {
     }
 }
 
+/// Skips entries of a shape this build doesn't know. The field is in beta, and
+/// failing the whole event over it would lose its usage and stop reason too.
+fn lenient_transformations<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<InputTransformation>>, D::Error> {
+    let Value::Array(entries) = Value::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let parsed = entries
+        .into_iter()
+        .filter_map(|entry| {
+            InputTransformation::deserialize(&entry)
+                .inspect_err(
+                    |e| warn!(error = %e, %entry, "skipping unparseable input transformation"),
+                )
+                .ok()
+        })
+        .collect();
+    Ok(Some(parsed))
+}
+
 #[derive(Deserialize)]
 struct MessagePayload {
     #[serde(default)]
     usage: Option<Usage>,
+    #[serde(default, deserialize_with = "lenient_transformations")]
+    input_transformations: Option<Vec<InputTransformation>>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +164,9 @@ struct MessageDeltaEvent {
     delta: Option<MessageDeltaPayload>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// Only after a server-side fallback, with the serving model's entries.
+    #[serde(default, deserialize_with = "lenient_transformations")]
+    input_transformations: Option<Vec<InputTransformation>>,
 }
 
 #[derive(Serialize)]
@@ -370,6 +396,7 @@ pub(super) struct EventParser {
     current_block_idx: usize,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
+    input_transformations: Vec<InputTransformation>,
 }
 
 impl EventParser {
@@ -380,6 +407,7 @@ impl EventParser {
             current_block_idx: 0,
             usage: TokenUsage::default(),
             stop_reason: None,
+            input_transformations: Vec::new(),
         }
     }
 
@@ -391,10 +419,13 @@ impl EventParser {
     ) -> Result<ControlFlow<(), ()>, AgentError> {
         match event_type {
             "message_start" => {
-                if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data)
-                    && let Some(u) = ev.message.usage
-                {
-                    self.usage = TokenUsage::from(u);
+                if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data) {
+                    if let Some(u) = ev.message.usage {
+                        self.usage = TokenUsage::from(u);
+                    }
+                    if let Some(t) = ev.message.input_transformations {
+                        self.input_transformations = t;
+                    }
                 }
             }
             "content_block_start" => match serde_json::from_str::<ContentBlockStartEvent>(data) {
@@ -506,6 +537,9 @@ impl EventParser {
                             }
                         }
                     }
+                    if let Some(t) = ev.input_transformations {
+                        self.input_transformations = t;
+                    }
                     if let Some(d) = ev.delta {
                         self.stop_reason = d
                             .stop_reason
@@ -538,6 +572,7 @@ impl EventParser {
             },
             usage: self.usage,
             stop_reason: self.stop_reason,
+            input_transformations: self.input_transformations,
         }
     }
 }
@@ -546,7 +581,7 @@ impl EventParser {
 mod tests {
     use std::sync::Arc;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::{
@@ -554,7 +589,12 @@ mod tests {
         long_context_window, strip_long_context,
     };
     use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
-    use crate::{Message, ThinkingConfig};
+    use crate::{ContentBlock, Message, Role, ThinkingConfig};
+
+    const SYSTEM: &str = "sys";
+    const TOOL_USE_ID: &str = "toolu_1";
+    const TOOL_SEARCH: &str = "tool_search";
+    const LOADED_TOOL: &str = "srv__fetch";
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -605,5 +645,86 @@ mod tests {
             Some(0.8),
         );
         assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
+    }
+
+    fn strip_cache_control(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("cache_control");
+                map.values_mut().for_each(strip_cache_control);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip_cache_control),
+            _ => {}
+        }
+    }
+
+    fn encode(messages: &[Message], tools: &Value) -> Value {
+        let mut body = build_request_body_with_system(
+            &test_model(),
+            messages,
+            &[SystemBlock {
+                r#type: "text",
+                text: SYSTEM,
+                cache_control: None,
+            }],
+            tools,
+            ThinkingConfig::Adaptive,
+            None,
+        );
+        strip_cache_control(&mut body);
+        body
+    }
+
+    /// Cache breakpoints move every turn and the cache ignores them. Everything
+    /// else must come back unchanged at the front of the next request, signed
+    /// thinking and replayed tool loads included, even after a late tool joined.
+    #[test]
+    fn encoded_request_is_a_prefix_of_the_next() {
+        let deferred = |name: &str| json!({"name": name, "defer_loading": true});
+        let tools = json!([{"name": "read"}, deferred(LOADED_TOOL)]);
+        let mut messages = vec![
+            Message::user("go".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "plan".into(),
+                        signature: Some("sig".into()),
+                    },
+                    ContentBlock::tool_use(TOOL_USE_ID, TOOL_SEARCH, json!({})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: TOOL_USE_ID.into(),
+                    content: String::new(),
+                    is_error: false,
+                    loaded_tools: vec![LOADED_TOOL.into()],
+                }],
+                ..Default::default()
+            },
+        ];
+        let before = encode(&messages, &tools);
+
+        let mut grown_tools = tools.clone();
+        grown_tools.as_array_mut().unwrap().push(deferred("late"));
+        messages.push(Message::context_update(
+            "date".into(),
+            "date".into(),
+            Default::default(),
+        ));
+        messages.push(Message::user("more".into()));
+        let after = encode(&messages, &grown_tools);
+
+        assert_eq!(before["system"], after["system"]);
+        for key in ["tools", "messages"] {
+            let (before, after) = (
+                before[key].as_array().unwrap(),
+                after[key].as_array().unwrap(),
+            );
+            assert_eq!(&after[..before.len()], before.as_slice(), "{key}");
+        }
     }
 }

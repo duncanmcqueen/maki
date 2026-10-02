@@ -422,8 +422,10 @@ impl SpawnCtx {
                 id: SessionRef::from(session.id),
                 history: session.messages().to_vec(),
                 context_size: session.meta.context_size,
+                frame: session.frame().cloned(),
                 // The tab owns the session and persists it through
-                // `StorageWriter`, so the agent gets the transcript only.
+                // `StorageWriter`, so the agent only gets the transcript and
+                // the frame it was sent under.
                 session: None,
             },
             self.config.clone(),
@@ -1707,9 +1709,11 @@ impl<'t> EventLoop<'t> {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
+                let workflow = rt.app.state.workflow;
                 rt.handles.queue.push(QueueItem::Compact(Compaction {
                     run_id,
                     instructions,
+                    workflow,
                 }));
             }
             Action::ToggleMcp(server_name, enabled) => {

@@ -182,7 +182,7 @@ fn message_json(message: &Message) -> serde_json::Value {
             Role::User => "user",
             Role::Assistant => "assistant",
         },
-        "kind": message.kind,
+        "kind": <&'static str>::from(&message.kind),
         "hidden": message.display_text.as_deref() == Some(""),
         "content": content,
     })
@@ -192,10 +192,12 @@ fn message_json(message: &Message) -> serde_json::Value {
 /// been sent so far, tool calls and results included. Read only.
 ///
 /// Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
-/// `"assistant"`. `kind` is `"turn"` for something the user or the model said
-/// and `"observation"` for a report sent to the model as a user message, like
-/// `maki.session.notify`. `hidden` marks a message only the model sees, such
-/// as a nudge or a compaction note. `content` lists blocks:
+/// `"assistant"`. `kind` is `"turn"` for something the user or the model said,
+/// `"observation"` for a report sent to the model as a user message, like
+/// `maki.session.notify`, and `"context_update"` for a change since the
+/// system prompt was built (date, model, plan mode, ...). `hidden` marks a
+/// message only the model sees, such as a nudge or a compaction note.
+/// `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }
@@ -759,6 +761,7 @@ mod tests {
     #[test_case(Role::User, MessageKind::Turn, None, "user", "turn", false ; "user_turn_is_visible")]
     #[test_case(Role::User, MessageKind::Observation, Some(""), "user", "observation", true ; "blank_display_text_is_hidden")]
     #[test_case(Role::Assistant, MessageKind::Turn, Some(TEXT), "assistant", "turn", false ; "display_text_with_content_is_visible")]
+    #[test_case(Role::User, MessageKind::ContextUpdate(Default::default()), Some(TEXT), "user", "context_update", false ; "context_update_kind_is_a_plain_name")]
     fn message_json_reports_role_kind_and_hidden(
         role: Role,
         kind: MessageKind,
